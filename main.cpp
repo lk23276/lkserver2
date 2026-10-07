@@ -92,7 +92,10 @@ int main(int argc, char* argv[])
     shutdownCtx.mainLoop = mainLoop;
     shutdownCtx.acceptor = acceptor;
     shutdownCtx.pool = pool;
-    shutdownCtx.sfd = signalfd(-1, &sigMask, 0);
+    // 必须 SFD_NONBLOCK: 否则 onSignalHandler 里 while(read>0) 排空信号后,
+    // 第二轮 read 会永久阻塞(阻塞模式无信号时 read 挂起), 导致主反应堆死锁、Ctrl+C 无法关闭。
+    // SFD_CLOEXEC: 避免 signalfd 被 exec 的子进程继承。
+    shutdownCtx.sfd = signalfd(-1, &sigMask, SFD_NONBLOCK | SFD_CLOEXEC);
     shutdownCtx.sigChannel = NULL;
     shutdownCtx.shuttingDown = false;
     if (shutdownCtx.sfd == -1) {

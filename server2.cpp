@@ -268,12 +268,25 @@ EpollDispatcher::~EpollDispatcher() {
     delete[] m_evs;
 }
 
+// 把项目自定义的逻辑事件位(READ_EVENT/WRITE_EVENT/ERROR_EVENT)翻译成 epoll 的 EPOLLxxx 常量。
+// 二者的数值并不相同: READ_EVENT=0x01(恰好等于 EPOLLIN), 但 WRITE_EVENT=0x02 而 EPOLLOUT=0x004,
+// ERROR_EVENT=0x04 而 EPOLLERR=0x008。若直接把逻辑位塞给 epoll_ctl 注册"写事件",
+// 实际注册的是 EPOLLPRI(0x02, 带外数据), 导致 EPOLLOUT 永不触发、
+// handleWrite 续发回调失效 -> 大文件(图片)写半包后剩余数据永远发不出去(响应被截断)。
+static uint32_t toEpollEvents(int ev) {
+    uint32_t e = 0;
+    if (ev & READ_EVENT)  e |= EPOLLIN;
+    if (ev & WRITE_EVENT) e |= EPOLLOUT;
+    if (ev & ERROR_EVENT) e |= EPOLLERR;
+    return e;
+}
+
 bool EpollDispatcher::add(Channel* ch) {
     int fd = ch->getSocket();
     struct epoll_event ev;
     ev.data.fd = fd;
     // 使用边沿触发 EPOLLET, 与原代码行为一致
-    ev.events = ch->getEvent() | EPOLLET;
+    ev.events = toEpollEvents(ch->getEvent()) | EPOLLET;
     int ret = epoll_ctl(m_epfd, EPOLL_CTL_ADD, fd, &ev);
     if (ret == -1) {
         perror("epoll_ctl add");
@@ -296,7 +309,8 @@ bool EpollDispatcher::modify(Channel* ch) {
     int fd = ch->getSocket();
     struct epoll_event ev;
     ev.data.fd = fd;
-    ev.events = ch->getEvent() | EPOLLET;
+    // 同样必须翻译逻辑事件位; 否则 enableWriting() 注册不到 EPOLLOUT, 写续发失效
+    ev.events = toEpollEvents(ch->getEvent()) | EPOLLET;
     int ret = epoll_ctl(m_epfd, EPOLL_CTL_MOD, fd, &ev);
     if (ret == -1) {
         perror("epoll_ctl mod");
@@ -528,7 +542,8 @@ bool EventLoopThreadPool::stopAll() {
 // TcpConnection 实现
 // =============================================================
 TcpConnection::TcpConnection(int fd, EventLoop* evLoop)
-    : m_fd(fd), m_evLoop(evLoop), m_writing(false) {
+    : m_fd(fd), m_evLoop(evLoop), m_writing(false), m_closeAfterWrite(false),
+      m_fileFd(-1), m_fileOffset(0), m_fileSize(0) {
     // 注册读 + 写回调到子反应堆; 写回调(handleWrite)用于 EPOLLOUT 续发
     m_channel = new Channel(m_fd, READ_EVENT,
                             TcpConnection::recHttpR, TcpConnection::handleWrite,
@@ -537,6 +552,10 @@ TcpConnection::TcpConnection(int fd, EventLoop* evLoop)
 }
 
 TcpConnection::~TcpConnection() {
+    if (m_fileFd >= 0) {   // 连接销毁时若还有未发完的文件, 释放其文件 fd
+        close(m_fileFd);
+        m_fileFd = -1;
+    }
     if (m_channel) {
         delete m_channel;
         m_channel = NULL;
@@ -547,7 +566,9 @@ Channel* TcpConnection::getChannel() { return m_channel; }
 
 // 应用层发送: 先尝试直接写, 写不完则缓存到输出缓冲并注册 EPOLLOUT 续发
 void TcpConnection::send(const char* data, size_t len) {
-    if (m_writing) {                 // 正在续发, 直接排队等待 EPOLLOUT 处理
+    // m_writing: 缓冲里还有待续发数据; m_fileFd>=0: 还有文件待 sendfile 发送。
+    // 两种情况都先排队, 由 handleWrite 依序发送, 保证"响应头在前、文件体在后"。
+    if (m_writing || m_fileFd >= 0) {
         m_outputBuffer.append(data, len);
         return;
     }
@@ -570,10 +591,57 @@ void TcpConnection::send(const char* data, size_t len) {
     }
 }
 
-// EPOLLOUT 触发: 从输出缓冲续发, 发完立即注销 EPOLLOUT(避免忙等)
+// 开始以 sendfile 零拷贝方式发送一个文件: 仅记录 fd/偏移/大小,
+// 数据由 sendfile 从文件直接送入 socket, 不经过应用层缓冲、不读入内存。
+// 若此刻仍有响应头等缓冲数据未发完, 先只登记, 由 handleWrite 在缓冲清空后启动。
+void TcpConnection::beginSendFile(int fd, off_t size) {
+    m_fileFd = fd;
+    m_fileOffset = 0;
+    m_fileSize = size;
+    if (m_writing) {
+        return;        // 前面还有数据没发完, 等 handleWrite 调用 doSendFile
+    }
+    doSendFile();      // 缓冲已空, 立即开始
+}
+
+// sendfile 续发循环: 非阻塞 socket 下缓冲满返回 EAGAIN, 此时武装 EPOLLOUT 让出线程,
+// 待内核可写时回到 handleWrite 继续从 m_fileOffset 发送 —— 不自旋、不阻塞。
+void TcpConnection::doSendFile() {
+    while (m_fileOffset < m_fileSize) {
+        ssize_t n = sendfile(m_fd, m_fileFd, &m_fileOffset,
+                             (size_t)(m_fileSize - m_fileOffset));
+        if (n > 0) {
+            continue;                                  // 已发出 n 字节, 继续
+        } else if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            m_writing = true;
+            enableWriting();                           // 武装 EPOLLOUT, 等可写续发
+            return;
+        } else if (n < 0 && errno == EINTR) {
+            continue;                                  // 被信号打断, 重试
+        } else if (n < 0) {
+            perror("sendfile");
+            destroyConnection(this);
+            return;
+        } else {
+            break;                                     // n == 0(极少见)
+        }
+    }
+    // 文件发送完毕: 关闭文件 fd, 解除 EPOLLOUT 收尾
+    close(m_fileFd);
+    m_fileFd = -1;
+    m_fileOffset = 0;
+    m_fileSize = 0;
+    m_writing = false;
+    disableWriting();
+    if (m_closeAfterWrite) {
+        destroyConnection(this);
+    }
+}
+
+// EPOLLOUT 触发: 先发完应用层缓冲(响应头/目录列表), 再 sendfile 续发文件
 void TcpConnection::handleWrite(void* arg) {
     TcpConnection* conn = (TcpConnection*)arg;
-    // 循环发送直到缓冲发完或内核发送缓冲满(EAGAIN), 避免 ET 下漏触发
+    // 1. 先发完应用层缓冲
     while (conn->m_outputBuffer.readableBytes() > 0) {
         ssize_t n = ::send(conn->m_fd, conn->m_outputBuffer.peek(),
                            conn->m_outputBuffer.readableBytes(), MSG_NOSIGNAL);
@@ -589,9 +657,18 @@ void TcpConnection::handleWrite(void* arg) {
             return;  // n == 0(极少见), 直接返回等待下次事件
         }
     }
-    // 全部发完 -> 解除 EPOLLOUT, 避免忙等烧 CPU
+    // 2. 缓冲已清空: 若还有文件待发, 交给 doSendFile 零拷贝续发(其内部处理收尾)
+    if (conn->m_fileFd >= 0) {
+        conn->doSendFile();
+        return;
+    }
+    // 3. 全部发完 -> 解除 EPOLLOUT, 避免忙等烧 CPU
     conn->m_writing = false;
     conn->disableWriting();
+    // 若对端已 FIN 且要求"发完再关", 此时数据已空, 安全关闭连接(不会丢弃尾部)
+    if (conn->m_closeAfterWrite) {
+        destroyConnection(conn);
+    }
 }
 
 void TcpConnection::enableWriting() {
@@ -602,6 +679,19 @@ void TcpConnection::enableWriting() {
 void TcpConnection::disableWriting() {
     m_channel->setEvent(READ_EVENT);
     m_evLoop->modifyChannel(m_channel);
+}
+
+void TcpConnection::setCloseAfterWrite(bool v) {
+    m_closeAfterWrite = v;
+}
+
+// 正文发送完毕后调用: 若要求"发完关闭"且已无待续发数据(缓冲为空且无待发文件), 立即关闭;
+// 若仍有数据在途(会走 EPOLLOUT 续发), 则交给 handleWrite 在清空后关闭
+void TcpConnection::tryCloseAfterWrite() {
+    if (m_closeAfterWrite && !m_writing && m_fileFd < 0 &&
+        m_outputBuffer.readableBytes() == 0) {
+        destroyConnection(this);
+    }
 }
 
 // 读事件回调, 逻辑与原 recHttpR 完全一致
@@ -629,7 +719,14 @@ void TcpConnection::recHttpR(void* arg) {
             parseRL(conn->m_buf, conn);
         }
     } else if (len == 0) {
-        // 客户端断开了连接
+        // 客户端断开了连接(FIN)
+        // 若还有数据在输出缓冲/内核发送缓冲中未发出, 不能直接 close(会丢弃图片尾部),
+        // 改为标记"发完再关", 由 handleWrite 在缓冲清空后统一关闭
+        if (conn->m_writing || conn->m_fileFd >= 0 ||
+            conn->m_outputBuffer.readableBytes() > 0) {
+            conn->m_closeAfterWrite = true;
+            return;
+        }
         conn->m_evLoop->removeChannel(conn->m_channel);
         close(conn->m_fd);
         delete conn;
@@ -783,6 +880,8 @@ int parseRL(const char* line, TcpConnection* conn) {
         // 文件不存在 -- 回复404
         seadHeadM(conn, 404, "Not Found", getFT(".html"), -1);
         sendFile(conn, "404.html");
+        conn->setCloseAfterWrite(true);   // 配合 Connection: close, 正文发完后关闭
+        conn->tryCloseAfterWrite();       // 若已同步发完则立即关, 否则由 handleWrite 关闭
         return 0;
     }
     // 判断文件类型
@@ -790,6 +889,8 @@ int parseRL(const char* line, TcpConnection* conn) {
         // 把这个目录中的内容发送给客户端
         seadHeadM(conn, 200, "OK", getFT(".html"), -1);
         sendDir(conn, file);
+        conn->setCloseAfterWrite(true);   // 配合 Connection: close, 正文发完后关闭
+        conn->tryCloseAfterWrite();       // 若已同步发完则立即关, 否则由 handleWrite 关闭
     } else {
         // 把文件的内容发送给客户端
         seadHeadM(conn, 200, "OK", getFT(file), st.st_size);
@@ -874,55 +975,43 @@ int sendDir(TcpConnection* conn, const char* dirName) {
 }
 
 int sendFile(TcpConnection* conn, const char* fileName) {
-    //1.打开文件
+    //1.打开文件(只读)
     int fd;
     fd = open(fileName, O_RDONLY);
     if (fd < 0) {                       // 安全写法: 检查 open 失败(原 assert(fd>0) 在 Release 下失效)
         perror("open");
         return -1;
     }
+    //2.取文件大小(仅用于发送边界 / content-length; 数据不读入内存)
     off_t size = lseek(fd, 0, SEEK_END);
-    lseek(fd, 0, SEEK_SET);
     if (size < 0) {
         perror("lseek");
         close(fd);
         return -1;
     }
-    // 将文件读入内存, 统一走 conn->send() 的应用层 Buffer + EPOLLOUT 续发,
-    // 彻底消除 sendfile 遇 EAGAIN 死循环 / 写半包丢失的隐患
-    char* data = new (std::nothrow) char[size > 0 ? (size_t)size : 1];
-    if (data == NULL) {
-        close(fd);
-        return -1;
-    }
-    ssize_t total = 0;
-    while (total < size) {
-        ssize_t n = read(fd, data + total, (size_t)size - (size_t)total);
-        if (n > 0) {
-            total += n;
-        } else if (n == 0) {
-            break;
-        } else if (errno == EINTR) {
-            continue;
-        } else {
-            perror("read");
-            break;
-        }
-    }
-    close(fd);
-    conn->send(data, (size_t)total);
-    delete[] data;
+    lseek(fd, 0, SEEK_SET);
+    //3.零拷贝发送: 把"待发送文件"(fd)交给连接, 由 sendfile + EPOLLOUT 续发完成。
+    //  既不像原 sendfile 循环那样在 EAGAIN 上自旋/阻塞卡死事件循环,
+    //  也不像"整文件读入内存"那样占用 O(文件大小) 内存(GB 级文件 OOM 风险)。
+    conn->beginSendFile(fd, size);
     return 0;
 }
 
-int seadHeadM(TcpConnection* conn, int status, const char* descr, const char* type, int length) {
+int seadHeadM(TcpConnection* conn, int status, const char* descr, const char* type, long long length) {
     // 状态行
     char buf[4096] = { 0 };
     // 安全写法: snprintf 带剩余缓冲区长度, 防止超长响应头溢出
     snprintf(buf, sizeof(buf), "http/1.1 %d %s\r\n", status, descr);
     // 响应头
     snprintf(buf + strlen(buf), sizeof(buf) - strlen(buf), "content-type: %s\r\n", type);
-    snprintf(buf + strlen(buf), sizeof(buf) - strlen(buf), "content-length: %d\r\n\r\n", length);
+    // length>=0: 正常文件, 发送准确的 content-length(浏览器据此判断正文边界)
+    // length<0 : 404/目录等无法预知长度, 发送 Connection: close, 由调用方在正文发完后关闭连接,
+    //            避免发送 content-length: -1 这种非法头部导致浏览器无法界定正文
+    if (length >= 0) {
+        snprintf(buf + strlen(buf), sizeof(buf) - strlen(buf), "content-length: %lld\r\n\r\n", length);
+    } else {
+        snprintf(buf + strlen(buf), sizeof(buf) - strlen(buf), "connection: close\r\n\r\n");
+    }
     conn->send(buf, strlen(buf));   // 走应用层 Buffer + EPOLLOUT 续发, 不再裸 send
     return 0;
 }

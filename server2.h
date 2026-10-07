@@ -17,6 +17,7 @@
 #include <sys/select.h>   // fd_set
 #include <poll.h>         // pollfd
 #include <sys/epoll.h>    // epoll_event
+#include <sys/types.h>    // off_t
 
 using namespace std;
 
@@ -276,14 +277,23 @@ public:
     static void handleWrite(void* arg);         // EPOLLOUT 续发回调
     void enableWriting();                       // 注册 EPOLLOUT
     void disableWriting();                      // 注销 EPOLLOUT
+    void beginSendFile(int fd, off_t size);     // 以 sendfile 零拷贝方式发送文件(配合 EPOLLOUT 续发)
+    void setCloseAfterWrite(bool v);            // 输出缓冲发完后关闭连接(避免截断响应)
+    void tryCloseAfterWrite();                  // 正文同步发完且无待续发时立即关闭(配合 Connection: close)
 
 private:
+    void doSendFile();      // 内部: sendfile 循环, EAGAIN 时武装 EPOLLOUT 等待续发
+
     int m_fd;
     EventLoop* m_evLoop;
     Channel* m_channel;
     char m_buf[4096];  // 接收缓冲区, 与原代码一致
     Buffer m_outputBuffer;  // 输出缓冲(写半包续发)
     bool m_writing;         // 是否有数据待 EPOLLOUT 续发
+    bool m_closeAfterWrite; // 输出缓冲发完后关闭连接(对端已 FIN 时避免丢弃尾部)
+    int m_fileFd;           // 待 sendfile 发送的文件 fd, -1 表示无
+    off_t m_fileOffset;     // sendfile 当前偏移(内核按实际发送量推进)
+    off_t m_fileSize;       // 文件总大小
 };
 
 // ============ 接收器 Acceptor (运行在主反应堆) ============
@@ -308,7 +318,7 @@ private:
 int initLis(unsigned short port);          // 初始化监听的套接字
 int parseRL(const char* line, TcpConnection* conn);    // 解析请求行
 int sendFile(TcpConnection* conn, const char* fileName);// 发送文件
-int seadHeadM(TcpConnection* conn, int status, const char* descr, const char* type, int length); // 发送响应头
+int seadHeadM(TcpConnection* conn, int status, const char* descr, const char* type, long long length); // 发送响应头
 const char* getFT(const char* name);       // 获取文件类型(MIME)
 int sendDir(TcpConnection* conn, const char* dirName); // 发送目录列表
 int hexToDec(char c);                       // 十六进制字符转十进制

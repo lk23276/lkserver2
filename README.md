@@ -33,7 +33,8 @@
 | ------------ | --------------------------------------------------------- | ------------------------------------------------------------------ |
 | 主从 Reactor   | `Acceptor::acceptC` → `getNextLoop` → `new TcpConnection` | 单主线程 accept，规避惊群；内部轮询分发                                            |
 | eventfd 精确唤醒 | `EventLoop::wakeup` / `handleWakeup`                      | 跨线程加入新连接 / 优雅关闭时 `write(eventfd,1)` 立即唤醒，消除原 2 秒 `epoll_wait` 超时延迟 |
-| 写半包续发        | `TcpConnection::send` / `handleWrite` + `Buffer`          | 应用层输出缓冲 + `EPOLLOUT`，部分写缓存续发；发完即注销 `EPOLLOUT` 防忙等                  |
+| 写半包续发        | `TcpConnection::send` / `handleWrite` + `Buffer`          | 响应头/目录等应用层输出缓冲 + `EPOLLOUT`，部分写缓存续发；发完即注销 `EPOLLOUT` 防忙等            |
+| 零拷贝文件发送      | `TcpConnection::beginSendFile` / `doSendFile`（`sendfile`） | 文件由内核直接从页缓存送入 socket，不经用户态缓冲；`EAGAIN` 时武装 `EPOLLOUT` 续发，不自旋/不阻塞、不占内存 |
 | SIGPIPE 防护   | `send(..., MSG_NOSIGNAL)`                                 | 对端断开时返回 `-1/EPIPE` 而非被杀进程                                          |
 | 优雅关闭         | `signalfd` + `onSignalHandler`                            | `SIGINT/SIGTERM` → 停 accept → 停子反应堆 `join` → 退主循环，安全退出             |
 | 安全格式化        | `snprintf` / `sscanf` 宽度限定                                | 防缓冲区溢出（原 `sprintf` 已替换）                                            |
@@ -56,32 +57,45 @@ server2/
 
 ## 四、构建与运行
 
-### 方式一：Linux 命令行（Makefile）
+### 构建
+
+**方式一：Linux 命令行（Makefile）**
 
 ```bash
-# 在含有源码的目录下
-make                # 生成可执行文件 server2
-./server2 607 ./    # 监听 607 端口，以当前目录作为 Web 根目录
-# 可选第三个参数指定多路转接机制：
-./server2 607 ./ epoll     # 默认
-./server2 607 ./ poll
-./server2 607 ./ select
+make        # 生成可执行文件
 ```
 
-- 端口：第一个参数（示例 `607`）。
-- 根目录：第二个参数（示例 `./`，server2 会 `chdir` 到这里）。
-- 子反应堆线程数：源码 `main.cpp` 中 `subReactorNum`（默认 4），可按 CPU 核数调整。
+**方式二：Visual Studio 远程 Linux**
 
-### 方式二：Visual Studio 远程 Linux
+用 Visual Studio 打开 `server2.vcxproj` / 解决方案，连接 Linux 虚拟机后远程编译（工程已定义 `_GNU_SOURCE`，`eventfd` / `signalfd` 等 GNU 扩展声明可见；需在工程属性中显式链接 `pthread`）。
 
-用 Visual Studio 打开 `server2.vcxproj` / 解决方案，连接到 Linux 虚拟机后远程编译运行（工程已定义 `_GNU_SOURCE`，`eventfd`/`signalfd` 等 GNU 扩展声明可见；需在工程属性中显式链接 `pthread`）。
+### 运行
+
+```bash
+./server2 <端口号> <要展示的目录>
+```
+
+- **第一个参数**：**端口号**，服务监听的端口。
+- **第二个参数**：**要展示的目录**，即 Web 根目录。服务启动后会切换到（`chdir`）该目录；**网页中展示的就是该目录中的内容**——访问目录会列出目录内容，访问具体文件则返回该文件。
+- **注意**：该目录下**必须包含 `404.html`**，用于在请求的资源不存在时返回自定义的 404 页面。
 
 ### 压测示例
 
 ```bash
-ab -n 10000 -c 100 http://192.168.144.68:607/
+ab -n <请求数> -c <并发数> http://<服务器IP>:<端口>/
 # 或用 wrk 观察 QPS / p99 / 错误率
 ```
+
+### 运行环境
+
+本项目在上述 Linux 虚拟机上编译、运行与验证：
+
+| 项目 | 配置 |
+| ---- | ---- |
+| 操作系统 | Linux **CentOS-Stream-10** |
+| 内存 | Memory 2GB |
+| 处理器 | Processors 1 |
+| 硬盘 | Hard Disk (SCSI) 50GB |
 
 ---
 
@@ -104,8 +118,8 @@ ab -n 10000 -c 100 http://192.168.144.68:607/
 - [ ] `m_isQuit` 改为 `std::atomic<bool>`，消除跨线程读写的数据竞争；
 - [ ] `recHttpR` 接收缓冲固定 4096 字节，超长请求会被截断 → 改用动态 `Buffer`；
 - [ ] `sendDir` 中 `stat` 返回值未检查；
-- [ ] 404 / 目录响应使用 `content-length: -1`（畸形 HTTP）→ 改用 `chunked` 编码或动态计算长度；
-- [ ] `sendFile` 整文件读入内存，大文件有 OOM 风险 → 结合 `EPOLLOUT` 背压的零拷贝 `sendfile`；
+- [x] 404 / 目录响应改用 `Connection: close`（原 `content-length: -1` 畸形头已移除），正文发完后关闭连接；
+- [x] `sendFile` 改为零拷贝 `sendfile` + `EPOLLOUT` 续发（不再整文件读入内存，消除大文件 OOM 风险）；
 - [ ] 优雅关闭时显式清理所有活跃 `TcpConnection`。
 
 ---
