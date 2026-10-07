@@ -29,15 +29,15 @@
                 └─────────────────────────────────────────────┘
 ```
 
-| 机制           | 实现位置                                                      | 说明                                                                 |
-| ------------ | --------------------------------------------------------- | ------------------------------------------------------------------ |
-| 主从 Reactor   | `Acceptor::acceptC` → `getNextLoop` → `new TcpConnection` | 单主线程 accept，规避惊群；内部轮询分发                                            |
-| eventfd 精确唤醒 | `EventLoop::wakeup` / `handleWakeup`                      | 跨线程加入新连接 / 优雅关闭时 `write(eventfd,1)` 立即唤醒，消除原 2 秒 `epoll_wait` 超时延迟 |
-| 写半包续发        | `TcpConnection::send` / `handleWrite` + `Buffer`          | 响应头/目录等应用层输出缓冲 + `EPOLLOUT`，部分写缓存续发；发完即注销 `EPOLLOUT` 防忙等            |
+| 机制           | 实现位置                                                      | 说明                                                                   |
+| ------------ | --------------------------------------------------------- | -------------------------------------------------------------------- |
+| 主从 Reactor   | `Acceptor::acceptC` → `getNextLoop` → `new TcpConnection` | 单主线程 accept，规避惊群；内部轮询分发                                              |
+| eventfd 精确唤醒 | `EventLoop::wakeup` / `handleWakeup`                      | 跨线程加入新连接 / 优雅关闭时 `write(eventfd,1)` 立即唤醒，消除原 2 秒 `epoll_wait` 超时延迟   |
+| 写半包续发        | `TcpConnection::send` / `handleWrite` + `Buffer`          | 响应头/目录等应用层输出缓冲 + `EPOLLOUT`，部分写缓存续发；发完即注销 `EPOLLOUT` 防忙等             |
 | 零拷贝文件发送      | `TcpConnection::beginSendFile` / `doSendFile`（`sendfile`） | 文件由内核直接从页缓存送入 socket，不经用户态缓冲；`EAGAIN` 时武装 `EPOLLOUT` 续发，不自旋/不阻塞、不占内存 |
-| SIGPIPE 防护   | `send(..., MSG_NOSIGNAL)`                                 | 对端断开时返回 `-1/EPIPE` 而非被杀进程                                          |
-| 优雅关闭         | `signalfd` + `onSignalHandler`                            | `SIGINT/SIGTERM` → 停 accept → 停子反应堆 `join` → 退主循环，安全退出             |
-| 安全格式化        | `snprintf` / `sscanf` 宽度限定                                | 防缓冲区溢出（原 `sprintf` 已替换）                                            |
+| SIGPIPE 防护   | `send(..., MSG_NOSIGNAL)`                                 | 对端断开时返回 `-1/EPIPE` 而非被杀进程                                            |
+| 优雅关闭         | `signalfd` + `onSignalHandler`                            | `SIGINT/SIGTERM` → 停 accept → 停子反应堆 `join` → 退主循环，安全退出               |
+| 安全格式化        | `snprintf` / `sscanf` 宽度限定                                | 防缓冲区溢出（原 `sprintf` 已替换）                                              |
 
 ---
 
@@ -90,12 +90,12 @@ ab -n <请求数> -c <并发数> http://<服务器IP>:<端口>/
 
 本项目在上述 Linux 虚拟机上编译、运行与验证：
 
-| 项目 | 配置 |
-| ---- | ---- |
+| 项目   | 配置                         |
+| ---- | -------------------------- |
 | 操作系统 | Linux **CentOS-Stream-10** |
-| 内存 | Memory 2GB |
-| 处理器 | Processors 1 |
-| 硬盘 | Hard Disk (SCSI) 50GB |
+| 内存   | Memory 2GB                 |
+| 处理器  | Processors 1               |
+| 硬盘   | Hard Disk (SCSI) 50GB      |
 
 ---
 
@@ -113,7 +113,7 @@ ab -n <请求数> -c <并发数> http://<服务器IP>:<端口>/
 
 ## 六、已知遗留与可升级点（TODO）
 
-以下问题在工程中已知存在，作为后续优化方向（面试可表述为「我还能怎么升级这个项目」）：
+以下问题在工程中已知存在，作为后续优化方向：
 
 - [ ] `m_isQuit` 改为 `std::atomic<bool>`，消除跨线程读写的数据竞争；
 - [ ] `recHttpR` 接收缓冲固定 4096 字节，超长请求会被截断 → 改用动态 `Buffer`；
